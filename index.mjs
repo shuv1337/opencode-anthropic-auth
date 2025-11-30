@@ -121,11 +121,28 @@ export async function AnthropicAuthPlugin({ client }) {
                 });
                 auth.access = json.access_token;
               }
+              // Add oauth-2025-04-20 beta to whatever betas are already present
+              const incomingBeta = init.headers?.["anthropic-beta"] || "";
+              const incomingBetasList = incomingBeta
+                .split(",")
+                .map((b) => b.trim())
+                .filter(Boolean);
+
+              // Add oauth beta and deduplicate
+              const mergedBetas = [
+                ...new Set([
+                  "oauth-2025-04-20",
+                  "claude-code-20250219",
+                  "interleaved-thinking-2025-05-14",
+                  "fine-grained-tool-streaming-2025-05-14",
+                  ...incomingBetasList,
+                ]),
+              ].join(",");
+
               const headers = {
                 ...init.headers,
                 authorization: `Bearer ${auth.access}`,
-                "anthropic-beta":
-                  "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
+                "anthropic-beta": mergedBetas,
               };
               delete headers["x-api-key"];
               return fetch(input, {
