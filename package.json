@@ -1,5 +1,5 @@
 {
-  "name": "opencode-anthropic-auth",
+  "name": "opencode-anthropic-auth-shuv",
   "version": "0.0.8",
   "main": "./index.mjs",
   "devDependencies": {

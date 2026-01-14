@@ -1,6 +1,281 @@
 import { generatePKCE } from "@openauthjs/openauth/pkce";
 
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_CODE_VERSION = "2.1.2";
+const CLAUDE_CODE_SYSTEM_PROMPT =
+  "You are Claude Code, Anthropic's official CLI for Claude.";
+
+const CLAUDE_CODE_TOOL_NAMES = {
+  read: "Read",
+  write: "Write",
+  edit: "Edit",
+  bash: "Bash",
+  grep: "Grep",
+  find: "Glob",
+  glob: "Glob",
+  ls: "Ls",
+};
+
+const CLAUDE_CODE_TOOL_NAMES_REVERSE = Object.fromEntries(
+  Object.entries(CLAUDE_CODE_TOOL_NAMES).map(([key, value]) => [value, key]),
+);
+
+const toClaudeCodeName = (name) => CLAUDE_CODE_TOOL_NAMES[name] || name;
+
+const fromClaudeCodeName = (name, reverseMap) =>
+  reverseMap?.get(name) || CLAUDE_CODE_TOOL_NAMES_REVERSE[name] || name;
+
+const CLAUDE_CODE_BETAS = [
+  "claude-code-20250219",
+  "oauth-2025-04-20",
+  "fine-grained-tool-streaming-2025-05-14",
+  "interleaved-thinking-2025-05-14",
+];
+
+const TOOL_CALL_ID_PATTERN = /[^a-zA-Z0-9_-]/g;
+
+const normalizeToolCallId = (id) =>
+  id.replace(TOOL_CALL_ID_PATTERN, "").slice(0, 40);
+
+const sanitizeToolCallId = (id) => id.replace(TOOL_CALL_ID_PATTERN, "_");
+
+const sanitizeSurrogates = (text) =>
+  text.replace(
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+    "",
+  );
+
+const stripThinkingTags = (text) => text.replace(/<\/?thinking>/g, "");
+
+const normalizeText = (text) => sanitizeSurrogates(text);
+
+const normalizeThinkingText = (text) =>
+  sanitizeSurrogates(stripThinkingTags(text));
+
+const hasImageOnlyContent = (blocks) =>
+  Array.isArray(blocks) &&
+  blocks.length > 0 &&
+  blocks.every((block) => block?.type === "image");
+
+const normalizeContentBlocks = (content) => {
+  if (typeof content === "string") {
+    return normalizeText(content);
+  }
+  if (!Array.isArray(content)) return content;
+
+  const normalized = content.map((block) => {
+    if (!block || typeof block !== "object") return block;
+    if (block.type === "text") {
+      return { ...block, text: normalizeText(block.text ?? "") };
+    }
+    return block;
+  });
+
+  if (hasImageOnlyContent(normalized)) {
+    normalized.unshift({ type: "text", text: "(see attached image)" });
+  }
+
+  return normalized;
+};
+
+const injectClaudeCodeSystemPrompt = (system) => {
+  if (!system) return CLAUDE_CODE_SYSTEM_PROMPT;
+
+  if (typeof system === "string") {
+    const normalized = normalizeText(system);
+    if (normalized.startsWith(CLAUDE_CODE_SYSTEM_PROMPT)) return normalized;
+    return `${CLAUDE_CODE_SYSTEM_PROMPT}\n${normalized}`;
+  }
+
+  if (Array.isArray(system)) {
+    const normalizedBlocks = system.map((block) => {
+      if (block?.type === "text" && typeof block.text === "string") {
+        return { ...block, text: normalizeText(block.text) };
+      }
+      return block;
+    });
+
+    const firstBlock = normalizedBlocks[0];
+    if (
+      firstBlock?.type === "text" &&
+      typeof firstBlock.text === "string" &&
+      firstBlock.text.startsWith(CLAUDE_CODE_SYSTEM_PROMPT)
+    ) {
+      return normalizedBlocks;
+    }
+
+    return [{ type: "text", text: CLAUDE_CODE_SYSTEM_PROMPT }, ...normalizedBlocks];
+  }
+
+  return system;
+};
+
+const transformMessages = (messages, mapToolName) => {
+  const toolCallIdMap = new Map();
+
+  const transformed = messages.map((message) => {
+    if (!message || typeof message !== "object") return message;
+
+    const content = message.content;
+    if (typeof content === "string") {
+      return { ...message, content: normalizeText(content) };
+    }
+
+    if (!Array.isArray(content)) return message;
+
+    const normalizedBlocks = content.flatMap((block) => {
+      if (!block || typeof block !== "object") return [block];
+
+      if (block.type === "text") {
+        return [{ ...block, text: normalizeText(block.text ?? "") }];
+      }
+
+      if (block.type === "thinking") {
+        const thinkingText = normalizeThinkingText(block.thinking ?? "");
+        if (!thinkingText.trim()) return [];
+        return [{ type: "text", text: thinkingText }];
+      }
+
+      if (block.type === "tool_use") {
+        const rawId = String(block.id ?? "");
+        const normalizedId = sanitizeToolCallId(normalizeToolCallId(rawId));
+        if (rawId && normalizedId && rawId !== normalizedId) {
+          toolCallIdMap.set(rawId, normalizedId);
+        }
+        return [
+          {
+            ...block,
+            id: normalizedId || rawId,
+            name: mapToolName(block.name),
+          },
+        ];
+      }
+
+      if (block.type === "tool_result") {
+        const rawToolUseId = String(block.tool_use_id ?? "");
+        const mappedToolUseId = toolCallIdMap.get(rawToolUseId) ?? rawToolUseId;
+        const normalizedToolUseId = sanitizeToolCallId(
+          normalizeToolCallId(mappedToolUseId),
+        );
+        return [
+          {
+            ...block,
+            tool_use_id: normalizedToolUseId || mappedToolUseId,
+            content: normalizeContentBlocks(block.content),
+          },
+        ];
+      }
+
+      if (block.type === "image") {
+        return [block];
+      }
+
+      return [block];
+    });
+
+    if (hasImageOnlyContent(normalizedBlocks)) {
+      normalizedBlocks.unshift({ type: "text", text: "(see attached image)" });
+    }
+
+    return { ...message, content: normalizedBlocks };
+  });
+
+  const result = [];
+  let pendingToolCalls = [];
+  let existingToolResultIds = new Set();
+
+  for (const message of transformed) {
+    if (message?.role === "assistant") {
+      if (pendingToolCalls.length > 0) {
+        const missingResults = pendingToolCalls.filter(
+          (toolCall) => !existingToolResultIds.has(toolCall.id),
+        );
+        if (missingResults.length > 0) {
+          result.push({
+            role: "user",
+            content: missingResults.map((toolCall) => ({
+              type: "tool_result",
+              tool_use_id: toolCall.id,
+              content: [{ type: "text", text: "No result provided" }],
+              is_error: true,
+            })),
+          });
+        }
+      }
+
+      const toolCalls = Array.isArray(message.content)
+        ? message.content.filter((block) => block?.type === "tool_use")
+        : [];
+
+      pendingToolCalls = toolCalls.map((toolCall) => ({
+        id: toolCall.id,
+        name: toolCall.name,
+      }));
+      existingToolResultIds = new Set();
+
+      result.push(message);
+      continue;
+    }
+
+    if (message?.role === "user") {
+      const toolResultIds = Array.isArray(message.content)
+        ? message.content
+            .filter((block) => block?.type === "tool_result")
+            .map((block) => block.tool_use_id)
+            .filter(Boolean)
+        : [];
+
+      if (toolResultIds.length > 0) {
+        toolResultIds.forEach((toolUseId) => existingToolResultIds.add(toolUseId));
+        result.push(message);
+        continue;
+      }
+
+      if (pendingToolCalls.length > 0) {
+        const missingResults = pendingToolCalls.filter(
+          (toolCall) => !existingToolResultIds.has(toolCall.id),
+        );
+        if (missingResults.length > 0) {
+          result.push({
+            role: "user",
+            content: missingResults.map((toolCall) => ({
+              type: "tool_result",
+              tool_use_id: toolCall.id,
+              content: [{ type: "text", text: "No result provided" }],
+              is_error: true,
+            })),
+          });
+        }
+        pendingToolCalls = [];
+        existingToolResultIds = new Set();
+      }
+
+      result.push(message);
+      continue;
+    }
+
+    result.push(message);
+  }
+
+  if (pendingToolCalls.length > 0) {
+    const missingResults = pendingToolCalls.filter(
+      (toolCall) => !existingToolResultIds.has(toolCall.id),
+    );
+    if (missingResults.length > 0) {
+      result.push({
+        role: "user",
+        content: missingResults.map((toolCall) => ({
+          type: "tool_result",
+          tool_use_id: toolCall.id,
+          content: [{ type: "text", text: "No result provided" }],
+          is_error: true,
+        })),
+      });
+    }
+  }
+
+  return result;
+};
 
 /**
  * @param {"max" | "console"} mode
@@ -155,56 +430,82 @@ export async function AnthropicAuthPlugin({ client }) {
                 }
               }
 
+              const isOAuthToken = auth.access?.includes("sk-ant-oat");
               const incomingBeta = requestHeaders.get("anthropic-beta") || "";
               const incomingBetasList = incomingBeta
                 .split(",")
                 .map((b) => b.trim())
                 .filter(Boolean);
 
-              const includeClaudeCode = incomingBetasList.includes(
-                "claude-code-20250219",
-              );
-
-              const mergedBetas = [
-                "oauth-2025-04-20",
-                "interleaved-thinking-2025-05-14",
-                ...(includeClaudeCode ? ["claude-code-20250219"] : []),
-              ].join(",");
+              const mergedBetas = Array.from(
+                new Set([
+                  ...(isOAuthToken ? CLAUDE_CODE_BETAS : []),
+                  ...incomingBetasList,
+                ]),
+              ).join(",");
 
               requestHeaders.set("authorization", `Bearer ${auth.access}`);
               requestHeaders.set("anthropic-beta", mergedBetas);
-              requestHeaders.set(
-                "user-agent",
-                "claude-cli/2.1.2 (external, cli)",
-              );
+              if (isOAuthToken) {
+                requestHeaders.set(
+                  "user-agent",
+                  `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`,
+                );
+                requestHeaders.set("x-app", "cli");
+              }
               requestHeaders.delete("x-api-key");
 
-              const TOOL_PREFIX = "mcp_";
+              const reverseToolNameMap = new Map();
+              const mapToolName = (name) => {
+                if (!isOAuthToken || !name) return name;
+                const mapped = toClaudeCodeName(name);
+                if (!reverseToolNameMap.has(mapped) && mapped !== name) {
+                  reverseToolNameMap.set(mapped, name);
+                }
+                return mapped;
+              };
+
               let body = requestInit.body;
               if (body && typeof body === "string") {
                 try {
                   const parsed = JSON.parse(body);
-                  // Add prefix to tools definitions
+
+                  if (isOAuthToken) {
+                    parsed.system = injectClaudeCodeSystemPrompt(parsed.system);
+                  } else if (typeof parsed.system === "string") {
+                    parsed.system = normalizeText(parsed.system);
+                  } else if (Array.isArray(parsed.system)) {
+                    parsed.system = parsed.system.map((block) => {
+                      if (block?.type === "text" && typeof block.text === "string") {
+                        return { ...block, text: normalizeText(block.text) };
+                      }
+                      return block;
+                    });
+                  }
+
                   if (parsed.tools && Array.isArray(parsed.tools)) {
                     parsed.tools = parsed.tools.map((tool) => ({
                       ...tool,
-                      name: tool.name ? `${TOOL_PREFIX}${tool.name}` : tool.name,
+                      name: tool.name ? mapToolName(tool.name) : tool.name,
                     }));
                   }
-                  // Add prefix to tool_use blocks in messages
-                  if (parsed.messages && Array.isArray(parsed.messages)) {
-                    parsed.messages = parsed.messages.map((msg) => {
-                      if (msg.content && Array.isArray(msg.content)) {
-                        msg.content = msg.content.map((block) => {
-                          if (block.type === "tool_use" && block.name) {
-                            return { ...block, name: `${TOOL_PREFIX}${block.name}` };
-                          }
-                          return block;
-                        });
-                      }
-                      return msg;
-                    });
+
+                  if (
+                    parsed.tool_choice &&
+                    typeof parsed.tool_choice === "object" &&
+                    parsed.tool_choice.type === "tool" &&
+                    parsed.tool_choice.name
+                  ) {
+                    parsed.tool_choice = {
+                      ...parsed.tool_choice,
+                      name: mapToolName(parsed.tool_choice.name),
+                    };
                   }
+
+                  if (parsed.messages && Array.isArray(parsed.messages)) {
+                    parsed.messages = transformMessages(parsed.messages, mapToolName);
+                  }
+
                   body = JSON.stringify(parsed);
                 } catch (e) {
                   // ignore parse errors
@@ -256,7 +557,16 @@ export async function AnthropicAuthPlugin({ client }) {
                     }
 
                     let text = decoder.decode(value, { stream: true });
-                    text = text.replace(/"name"\s*:\s*"mcp_([^"]+)"/g, '"name": "$1"');
+                    if (isOAuthToken) {
+                      text = text.replace(
+                        /("name"\s*:\s*")([^"]+)(")/g,
+                        (match, prefix, name, suffix) => {
+                          const mapped = fromClaudeCodeName(name, reverseToolNameMap);
+                          if (mapped === name) return match;
+                          return `${prefix}${mapped}${suffix}`;
+                        },
+                      );
+                    }
                     controller.enqueue(encoder.encode(text));
                   },
                 });
